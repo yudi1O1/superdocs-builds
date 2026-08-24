@@ -11,6 +11,32 @@ Severity, Occurrence, Detection, and the computed Risk Priority Number (RPN = S�
 the narrative sections of a PPAP (Production Part Approval Process) submission and an 8D
 (problem-solving / corrective-action) report.
 
+## What this actually does, end to end
+
+An engineer fills in a YAML file (failure modes, ratings, PPAP/8D narrative fields). The tool checks
+that file is complete, computes every number itself, and only then talks to SuperDocs — which lays the
+already-correct content into the customer's own template and hands back a finished document, gated by a
+human approval step before anything is final:
+
+```mermaid
+flowchart LR
+    A["Engineer's YAML input\n(failure modes, ratings,\nPPAP/8D fields)"] --> B{"validate.py\nComplete?"}
+    B -- "missing rating" --> B1["BLOCKED\nname the exact field—\nnever guess"]
+    B -- "clean" --> C["render.py\ncompute RPN = S×O×D\nbuild literal HTML table"]
+    C --> D["Upload customer's\nown template\n(becomes the live doc)"]
+    D --> E["SuperDocs chat_async\napproval_mode=ask_every_time"]
+    E --> F{"Human reviews\nevery proposed change"}
+    F -- "approve" --> G["export_document\n.docx / .pdf / .md"]
+    F -- "reject + feedback" --> E
+
+    style B1 fill:#c0392b,color:#fff
+    style G fill:#27ae60,color:#fff
+```
+
+Two customers can hand you two completely different Word templates for the same FMEA/PPAP/8D package —
+this tool drafts the identical underlying data onto either one, changing only the presentation. See
+[Live demo run](#live-demo-run) below for real numbers pulled straight out of a live API call.
+
 ## The one rule this tool is built around
 
 > Numbers the engineer did not supply are asked for, never invented.
@@ -148,6 +174,8 @@ you'll see it checks out for every row:
 | FM-02 | 9 | 2 | 4 | **72** |
 | FM-03 | 3 | 5 | 6 | **90** |
 
+![S/O/D ratings and computed RPN for the BA-204 bracket assembly FMEA](docs/images/rpn-chart.png)
+
 `scripts/demo_two_templates.py`, run live against templates A and B with this same input, confirmed:
 
 ```
@@ -214,14 +242,26 @@ fields from an uploaded source document, as an embedded instruction.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph offline["Offline — no network, no cost"]
+        Y["examples/*.yaml"] --> M["models.py\ntyped dataclasses"]
+        M --> V["validate.py\nblocking gate"]
+        V --> R["render.py\ncompute RPN,\nbuild HTML content block"]
+    end
+    subgraph live["Live — the four-call SuperDocs contract"]
+        T["customer_template_*.html"] --> U["1. upload_document"]
+        R --> C["2. chat_async\napproval_mode=ask_every_time"]
+        U --> C
+        C --> AP["3. approve_change\n(human-in-the-loop)"]
+        AP --> EX["4. export_document\n.docx / .pdf / .md"]
+    end
+    offline --> live
+    W["workflow.py"] -.orchestrates.-> U
+    W -.orchestrates.-> C
+    W -.orchestrates.-> AP
+    W -.orchestrates.-> EX
 ```
-YAML input --> models.py (typed) --> validate.py (blocking gate, no network)
-                                            |
-                                            v (only if clean)
-                              render.py (compute RPN, build HTML content block)
-                                            |
-                                            v
-   customer template --> upload --> chat (async, ask_every_time) --> approve (human gate) --> export
-                                            ^
-                                    workflow.py orchestrates all four calls
-```
+
+`client.py` is the thin REST wrapper around those four calls; `cli.py` is the only place that talks to
+a human (interactive approval prompts, `check`/`draft` subcommands).
