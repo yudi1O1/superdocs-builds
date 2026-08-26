@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from supplier_quality_drafter.client import SuperDocsClient
 from supplier_quality_drafter.io_yaml import load_draft_request
 from supplier_quality_drafter.models import DraftRequest
+from supplier_quality_drafter.verify import expected_facts
 from supplier_quality_drafter.workflow import approve_all, draft_document
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,30 +41,22 @@ def required_facts(req: DraftRequest) -> list[str]:
     Deliberately NOT a raw number scan over the whole document — a template's
     own boilerplate (e.g. "1-10 AIAG-VDA scale" in one template's instructions,
     absent in the other's) contains numbers too, and those are presentation,
-    not data. Comparing "every digit in the file" conflates the two. What must
-    be identical across templates is the engineer's data: every ID, every
-    computed RPN, every S/O/D rating, every date, every named responsible
-    party — each checked as an exact substring.
+    not data. Comparing "every digit in the file" conflates the two.
+
+    Builds on `verify.expected_facts` (the same check the drafter itself runs
+    after every export, so the demo and the tool can't drift apart) and adds the
+    free-text fields that only matter for a cross-template comparison.
     """
-    facts: list[str] = []
+    facts: list[str] = list(expected_facts(req))
     for fm in req.failure_modes:
-        facts.append(fm.id)
         facts.append(fm.failure_mode)
-        rpn = fm.rpn()
-        if rpn is not None:
-            facts.append(str(rpn))
         for value in (fm.severity, fm.occurrence, fm.detection):
             if value is not None:
                 facts.append(str(value))
     for a in req.actions:
-        facts.append(a.id)
         facts.append(a.recommended_action)
-        if a.target_date:
-            facts.append(a.target_date)
-    if req.ppap:
-        facts.append(req.ppap.part_number)
-        if req.ppap.submission_level is not None:
-            facts.append(str(req.ppap.submission_level))
+    if req.ppap and req.ppap.submission_level is not None:
+        facts.append(str(req.ppap.submission_level))
     if req.eightd:
         facts.append(req.eightd.d4_root_cause)
     return facts

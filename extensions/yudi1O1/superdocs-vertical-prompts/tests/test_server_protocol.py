@@ -39,7 +39,7 @@ def _server_params(pack_path: str) -> StdioServerParameters:
 
 
 @pytest.mark.parametrize("pack_path,expected_ids", [
-    (LEGAL_PACK, {"redline", "fallback_clause", "obligation_summary"}),
+    (LEGAL_PACK, {"redline", "fallback_clause", "draft_from_playbook", "obligation_summary"}),
     (REAL_ESTATE_PACK, {"draft_disclosure", "compare_addendum", "closing_checklist"}),
 ])
 async def test_list_prompts_matches_pack_commands(pack_path, expected_ids):

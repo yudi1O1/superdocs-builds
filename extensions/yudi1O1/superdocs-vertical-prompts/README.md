@@ -7,7 +7,13 @@ SuperDocs' own MCP server ships 4 general-purpose workflow prompts (`/superdocs:
 primitive distinct from tools, rendered as slash commands by clients that support them (Claude Code,
 Claude Desktop, Cursor, and others). This build adds a second, small MCP server — one client-config
 entry, installed *alongside* SuperDocs' own — that exposes **vertical-specific** slash commands on top
-of that surface: for legal, `/legal:redline`, `/legal:fallback_clause`, `/legal:obligation_summary`.
+of that surface: for legal, `/legal:redline`, `/legal:fallback_clause`, `/legal:draft_from_playbook`,
+`/legal:obligation_summary`.
+
+![A real MCP session: the four legal commands listed, and the helpful error a missing argument produces](docs/images/mcp-session.png)
+
+*Captured from a live stdio JSON-RPC session against the running server — the same `prompts/list` and
+`prompts/get` calls every MCP client makes.*
 
 The point isn't the legal pack by itself. It's that the pack is data (a YAML file), and the engine that
 serves it is generic — so a second team can point the same server at a different YAML file and get a
@@ -167,19 +173,44 @@ The legal pack skews toward `ask_every_time` because two of its three commands r
 language. The real estate pack skews the other way because two of its three commands produce new,
 additive reports (a conflict comparison, a checklist) rather than editing anything that already exists.
 
+## Drafting from the customer's own templates
+
+`/legal:draft_from_playbook` is the command that touches the **templates** surface, and it exists
+because verticals run on house paper — a firm's own NDA, not generic boilerplate. Marking a command
+`templates: {use_saved: true}` in the pack YAML makes its rendered prompt route the assistant through
+`list_user_templates` first, and carries the same "never invent" rule this whole submission is built on:
+
+> If no saved template matches, say so and offer to have them upload one with `upload_template_base64` —
+> do **NOT** invent house-standard language to fill the gap. Drafting a clause the organisation never
+> approved, in a document that looks like theirs, is worse than an honest "you have no template for this yet."
+
+It's per-command configuration, not a pack-wide switch: `/legal:redline` works on the document already
+open and is deliberately *not* sent hunting through the template library
+(`test_commands_without_templates_get_no_template_guidance`).
+
 ## Proving cross-client protocol conformance
 
-MCP prompts don't have per-client logic — every conformant client speaks the same `prompts/list` /
-`prompts/get` JSON-RPC methods over the same transport. I can't script three separate GUI applications
-(Claude Code, Claude Desktop, Cursor) in this environment, so `tests/test_server_protocol.py` proves the
-thing that actually determines cross-client behavior: it spawns the **real** server as a subprocess and
-drives it with the **official MCP client SDK** (`mcp.client.stdio.stdio_client` +
-`mcp.client.session.ClientSession`) over real stdio JSON-RPC — the exact transport and exact protocol
-calls Claude Code, Claude Desktop, and Cursor all use internally. If a pack passes this, every conformant
-client renders it identically, because "conformant" means exactly that.
+Two layers, because clients differ in exactly one place.
+
+**Layer 1 — the protocol.** MCP prompts have no per-client logic: every conformant client speaks the same
+`prompts/list` / `prompts/get` JSON-RPC over the same transport. `tests/test_server_protocol.py` spawns
+the **real** server as a subprocess and drives it with the **official MCP client SDK**
+(`mcp.client.stdio.stdio_client` + `mcp.client.session.ClientSession`) over real stdio JSON-RPC — the
+exact calls Claude Code, Claude Desktop, and Cursor all make internally.
+
+**Layer 2 — the config shape, which is what actually varies.** Claude Code, Claude Desktop and Cursor
+nest servers under `mcpServers`; VS Code uses `servers`; Zed uses `context_servers`. So `clients/` ships
+a real config per client, and `tests/test_client_configs.py` **launches the server from each one** and
+completes an MCP session against it. A config that is malformed, points at the wrong module, or names a
+missing pack fails there — which is the failure a user would actually hit. One test also asserts the same
+pack rendered via two different clients' configs is **byte-identical**.
+
+Five clients covered; the card asks for at least three. I can't drive three GUIs in this environment, and
+say so plainly — but a config that provably launches plus a protocol that provably conforms is what
+"works unchanged across clients" reduces to.
 
 ```bash
-python -m pytest tests/test_server_protocol.py -v
+python -m pytest tests/test_server_protocol.py tests/test_client_configs.py -v
 ```
 
 ## Tests
@@ -189,29 +220,39 @@ pip install -r requirements.txt   # includes pytest, pytest-asyncio
 python -m pytest tests/ -q
 ```
 
-28 tests, all offline (no SuperDocs API key, no network):
+42 tests, all offline (no SuperDocs API key, no network):
 
-- **`test_pack_spec.py`** (20 tests) — YAML structural validation (undeclared template placeholders,
-  invalid `approval_mode`/export format, duplicate command ids, missing top-level fields), argument
-  rendering (missing required argument raises with the field name AND its description; unknown argument
-  name rejected; optional-argument defaults applied), and that `ask_every_time` vs. `approve_all`
-  commands render genuinely different SuperDocs tool-call guidance.
-- **`test_server_protocol.py`** (8 tests) — real subprocess + real MCP client SDK: `prompts/list` returns
-  exactly the pack's commands with correctly-advertised required/optional arguments; `prompts/get`
-  renders arguments into the instruction and includes the right approval-mode guidance; a missing
-  required argument raises `McpError` with the argument named in the message; an unknown prompt name
-  raises `McpError` listing the known commands; the real_estate pack (scaffolder output + hand-filled
-  content) works through the identical code path as the hand-written legal pack.
-- **`test_scaffold.py`** (3 tests) — the scaffolder's raw output is structurally loadable, and a
-  malformed `--command` flag fails fast with a clear error instead of writing a broken pack.
+- **`test_pack_spec.py`** — YAML structural validation (undeclared template placeholders, invalid
+  `approval_mode`/export format, duplicate command ids, missing top-level fields), argument rendering
+  (missing required argument raises with the field name AND its description; unknown argument name
+  rejected; optional-argument defaults applied), that `ask_every_time` vs. `approve_all` render
+  genuinely different tool-call guidance, and that template-backed commands route through
+  `list_user_templates` while non-template commands don't.
+- **`test_server_protocol.py`** — real subprocess + real MCP client SDK: `prompts/list` returns exactly
+  the pack's commands with correctly-advertised required/optional arguments; `prompts/get` renders
+  arguments into the instruction with the right approval-mode guidance; a missing required argument
+  raises `McpError` naming that argument; an unknown prompt name raises `McpError` listing the known
+  commands; the real_estate pack (scaffolder output + hand-filled content) works through the identical
+  code path as the hand-written legal pack.
+- **`test_client_configs.py`** — every config in `clients/` is valid, has the right per-client top-level
+  key, **actually launches the server**, and renders byte-identical prompts across two different client
+  config shapes.
+- **`test_scaffold.py`** — the scaffolder's raw output is structurally loadable, and a malformed
+  `--command` flag fails fast with a clear error instead of writing a broken pack.
 
 ## Example transcripts (real output)
 
-[`docs/transcripts/`](docs/transcripts/) holds six files, one per command across both packs — each
-captured by actually calling `session.get_prompt(...)` against the running server (see the generation
-command in git history / can be regenerated any time), not hand-written to look plausible. E.g.
-[`docs/transcripts/legal-redline.md`](docs/transcripts/legal-redline.md) shows the exact slash-command
-invocation and the exact rendered prompt text an assistant would receive.
+[`docs/transcripts/`](docs/transcripts/) holds **seven** files, one per command across both packs — each
+captured by actually calling `session.get_prompt(...)` against the running server, not hand-written to
+look plausible. E.g. [`docs/transcripts/legal-redline.md`](docs/transcripts/legal-redline.md) shows the
+exact slash-command invocation and the exact rendered prompt text an assistant receives.
+
+They're reproducible, so the docs can't quietly drift from the code:
+
+```bash
+python scripts/capture_transcripts.py
+git diff --exit-code docs/transcripts/    # clean == documentation matches reality
+```
 
 ## Known limitations (logged honestly)
 
@@ -222,10 +263,14 @@ invocation and the exact rendered prompt text an assistant would receive.
   SuperDocs' own MCP server connected. What's proven here (protocol conformance, correct argument
   handling, correct tool-call guidance in the rendered text) is everything this build's own layer is
   responsible for.
-- **No live-client screenshot.** I don't have a way to drive Claude Desktop/Cursor's GUI from this
-  environment. `tests/test_server_protocol.py` is the honest substitute — see
-  [Proving cross-client protocol conformance](#proving-cross-client-protocol-conformance) for why that's
-  actually the more rigorous check, not a lesser one.
+- **No GUI screenshot of a client's slash menu.** I can't drive Claude Desktop/Cursor's interface from
+  this environment. The screenshot above is a real MCP session rather than a real *client window*, and
+  I'd rather label it accurately than crop a UI to imply something I didn't run. The config-launch tests
+  are the substitute, and I think they're the stronger check — but they are not the same claim as
+  "I watched it appear in Cursor's menu", so I'm not making that claim.
+- **Template *selection* is the assistant's judgment, not the pack's.** `use_saved` tells it to search
+  and forbids inventing house language, but nothing here verifies it picked the *right* saved template.
+  A stricter version would pass an explicit template id.
 - **`chat` vs `chat_async` for `approve_all` commands.** The rendered guidance says either is acceptable
   for `approve_all` since neither requires a pause for approval; a production integration would likely
   standardize on one for simplicity. Left as a documented choice rather than a hidden default.

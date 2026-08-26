@@ -11,6 +11,12 @@ Severity, Occurrence, Detection, and the computed Risk Priority Number (RPN = S�
 the narrative sections of a PPAP (Production Part Approval Process) submission and an 8D
 (problem-solving / corrective-action) report.
 
+![A real drafted FMEA on a customer's branded template — RPN column computed in render.py, not by the model](docs/images/drafted-document.png)
+
+*Real output, exported from SuperDocs as `.docx` in session `demo-two-templates-a`. Check the RPN column
+against S×O×D on any row. The raw export is committed at
+[`docs/samples/demo-template-a.md`](docs/samples/demo-template-a.md).*
+
 ## What this actually does, end to end
 
 An engineer fills in a YAML file (failure modes, ratings, PPAP/8D narrative fields). The tool checks
@@ -56,14 +62,10 @@ missing `detection` rating.
 python -m supplier_quality_drafter check examples/sample_input.yaml
 ```
 
-```
-[BLOCKING] failure_mode FM-03: detection was not supplied. Ask the engineer for a 1-10 detection
-rating instead of drafting a number for it.
+![The validation gate refusing to draft because one detection rating is missing](docs/images/cli-validation-gate.png)
 
-1 blocking finding(s) — fix these before drafting.
-```
-
-Fill in the rating and it passes clean.
+Fill in the rating and it passes clean. Note the exit status: the blocked run makes **no API call and
+spends no operation** — the gate is entirely offline, so being strict is free.
 
 ## What "strong" looks like here, and how this build demonstrates it
 
@@ -111,6 +113,48 @@ change (old/new HTML, the AI's stated reason) and prompts before approving it. `
 the prompt for CI/demo runs — it still goes through the same approve endpoint, it just answers yes to
 everything automatically. Rejecting a change doesn't discard the rest of the batch (the `changes[]`
 array carries per-change decisions).
+
+## Running cost money, so: idempotency, degradation, and a cost report
+
+Drafting is a **billable** SuperDocs operation that takes minutes. Three behaviors follow from that.
+
+**It doesn't buy the same operation twice.** Every draft is fingerprinted over everything that could
+change its output — the session, the full instruction (which encodes every engineer-supplied number),
+the template's *bytes*, and the export format. Re-running identical work reuses the previous result and
+spends nothing:
+
+```
+$ python -m supplier_quality_drafter draft ... --out out/acme.docx
+Drafted: out/acme.docx
+Cost: 1 billable request(s) issued. Account: 45/500 operations used this month (455 remaining, tier=free).
+
+$ python -m supplier_quality_drafter draft ...          # same inputs, again
+Skipped (already drafted): out/acme.docx
+Cost: 0 billable request(s) issued — an identical draft completed at 2026-08-26T20:11:04+00:00 ...
+```
+
+Two deliberate refusals to be clever, both tested: a ledger entry whose **output file was deleted is not
+treated as done** (a success message that isn't true is worse than a redundant operation), and the
+template is **hashed by content, not path** — editing a template in place correctly forces a redraft.
+`--force` overrides; a corrupt ledger degrades open rather than blocking work.
+
+**It degrades instead of dying.** `client.py` retries 429s, 5xx, and dropped connections with
+exponential backoff plus jitter, honoring `Retry-After` when the server sends one. A rate limit or a
+brief blip turns a run slower, not failed. Client errors (400/404/422) are *not* retried — retrying them
+only burns time and money.
+
+**Errors name the cause and the fix.** Every status maps to an actionable sentence rather than a bare
+code:
+
+```
+POST /v1/chat/s1/approve -> [422] SuperDocs understood the request but a field failed validation.
+Fix: on /approve this is almost always a missing top-level 'approved' field — it is required even
+when every entry in 'changes' carries its own. Server said: {...}
+```
+
+**It reports what it cost.** The `usage` block SuperDocs returns on every chat response is surfaced
+verbatim after each run — operations used, remaining, and tier. Reported, never estimated; when the
+server sends no usage block, the tool says exactly that instead of guessing.
 
 ## Setup
 
@@ -184,12 +228,57 @@ verbatim in both outputs. The two documents differ only in the surrounding templ
 wording — content parity holds.
 ```
 
-A real bug this live run caught and fixed: the CLI crashed on Windows (`UnicodeEncodeError`) when the
-AI's response text contained an emoji the default `cp1252` console codepage couldn't encode — the
-`.docx` had already exported successfully by that point, only the summary print failed. Fixed by
-reconfiguring stdout/stderr to UTF-8 at CLI startup (see `cli.py`). Worth flagging as a general
-integration note for anyone building a SuperDocs CLI for Windows: the AI's `response` text is
-UTF-8/emoji-capable and your output stream needs to be too.
+### Two bugs the live runs caught — the second one mattered
+
+**1. A Windows console crash (mine).** The CLI died with `UnicodeEncodeError` when the AI's response
+contained an emoji the default `cp1252` codepage couldn't encode. The `.docx` had already exported fine;
+only the summary print failed. Fixed by reconfiguring stdout/stderr to UTF-8 at startup (`cli.py`).
+General note for anyone building a SuperDocs CLI on Windows: the `response` text is emoji-capable and
+your output stream needs to be too.
+
+**2. A success message that wasn't true (mine, and much worse).** On a cold session, SuperDocs returned
+a **`completed`** job whose response read:
+
+```
+⚠️ 0 of 4 asked could be completed.
+• Failed: an edit — no matching sections were found to act on
+Notes: ... none of the requested operations could be applied, and the document was not modified.
+```
+
+The document was untouched — and this tool printed `Drafted: out/verify-final.docx` and recorded the run
+in its idempotency ledger as finished work. So the *next* run would have "skipped" and handed back a
+document that had never been drafted. Two failures compounding: a false success, then that false success
+being cached.
+
+The root cause was treating `status == "completed"` as "it worked". It isn't. The fix, in
+[`verify.py`](supplier_quality_drafter/verify.py) and the workflow:
+
+- **`document_was_modified()`** — a turn that returns no `updated_html`, or returns HTML identical to
+  what was uploaded, is a no-op regardless of status. It now raises `DraftNotApplied` instead of
+  reporting success, quotes what SuperDocs actually said, exports nothing, and records nothing.
+- **A retry on the no-op**, because this is documented SuperDocs behavior rather than a mystery: *"the
+  first request in a fresh session can be slow or can fail while things warm up. Send it again and it
+  settles."* It did settle on the second attempt.
+- **`verify_export()`** — after export, the file on disk is read back (a `.docx` is a zip, so its body
+  XML is checked without adding a `python-docx` dependency) and every expected fact — failure-mode ids,
+  computed RPNs, action ids, dates, part number — must be present. Missing facts raise `DraftUnverified`.
+  Unreadable formats like PDF are reported as *"verification skipped, not passed"*, never counted as a pass.
+
+Both live behaviors are now locked down by
+[`tests/test_never_bluffs.py`](tests/test_never_bluffs.py), which replays that exact payload offline. The
+run after the fix:
+
+```
+Drafted: out/verify-final.docx
+Review: 4 change(s) approved, 0 rejected.
+Verified: 11/11 expected fact(s) present in the exported file.
+Cost: 1 billable request(s) issued. Account: 0/500 operations used this month (500 remaining, tier=free).
+```
+
+*Worth reporting upstream, not as a bug but as an integration hazard:* a job can reach `completed` with
+every operation failed, so `status` alone is not a success signal. The response body says so clearly —
+but an integrator switching on status will silently ship false successes, as this one did until a live
+run caught it.
 
 ## Tests (no live key required)
 
@@ -198,7 +287,7 @@ pip install -r requirements.txt   # includes pytest
 python -m pytest tests/ -q
 ```
 
-21 tests, all offline:
+59 tests, all offline:
 
 - `test_validate.py` — the "never invent a number" gate: missing ratings are blocking findings, not
   silently defaulted; out-of-range ratings are rejected; actions must trace to a real failure mode;
@@ -208,12 +297,24 @@ python -m pytest tests/ -q
   (a failure-mode description containing `<script>` cannot inject markup into the instruction sent to
   the API — see *Content safety* below).
 - `test_workflow.py` — the four-call contract, the human-in-the-loop approval loop (including multiple
-  rounds of `awaiting_approval` and a custom callback that rejects a change), and that
-  `draft_document` refuses to make **any** network call when validation fails.
+  rounds of `awaiting_approval`, a `continue_prompt` pause routed to `/continue` rather than `/approve`,
+  and a custom callback that rejects a change), that `draft_document` refuses to make **any** network
+  call when validation fails, and the idempotency gate (identical rerun spends zero billable calls;
+  `--force` and an edited template both correctly defeat the skip).
+- `test_client.py` — graceful degradation and actionable errors: 429/5xx/dropped-connection all retried
+  with backoff, `Retry-After` honored over our own curve, 4xx deliberately *not* retried, every mapped
+  status naming a concrete fix, and usage read from the server rather than estimated.
+- `test_ledger.py` — fingerprint stability and sensitivity (instruction, template bytes, export format),
+  a deleted output file never reported as "already done", and a corrupt ledger degrading open.
+- `test_never_bluffs.py` — replays the **exact** payload from the live run described above: a
+  `completed` job that changed nothing must raise rather than report success, must not export, and must
+  not be cached in the ledger; a cold session that settles on retry succeeds; an export missing the
+  engineer's facts is rejected; and an unverifiable format is reported as unverified rather than passed.
 
-Every network-touching call is behind a duck-typed `SuperDocsClient` interface, so `test_workflow.py`
-exercises the full orchestration logic against a `FakeClient` — no mocking library, no live key,
-no cost.
+Every network-touching call is behind a duck-typed interface, so the orchestration tests run against a
+`FakeClient` and the client tests run against a fake transport — **no mocking library, no live key, no
+cost, and no test that merely proves a mock works.** `test_client.py` drives the real retry/backoff/error
+code; only the socket is fake.
 
 ## Content safety: this tool doesn't take orders from the documents it edits
 
@@ -233,9 +334,15 @@ fields from an uploaded source document, as an embedded instruction.
   template *is* the starting document for the session.
 - **PDF/DOCX customer templates work too**, but the two included demo templates are `.html` for
   readability in a PR diff. `SuperDocsClient.upload_document` takes any of DOCX/DOC/ODT/PDF/TXT/HTML/MD/RTF.
-- **No retry/resume logic for a killed process.** This build's card scopes it to `chat, templates,
-  export` and doesn't ask for crash-resumability (that requirement belongs to Task 1's agentic system,
-  not this build). `poll_job` has a timeout and raises cleanly on `failed`/timeout rather than hanging.
+- **Resumability is coarse-grained.** The ledger makes a re-run after a crash *cheap and safe* — an
+  already-completed draft is reused rather than re-billed. But a process killed **mid-job**, after
+  `chat_async` returned a `job_id` and before the export, does not reconnect to that in-flight job on
+  restart; it starts the draft again. The honest fix is persisting `job_id` at creation and re-polling
+  it on startup, which is a ~20-line change I chose not to make because this build's card scopes it to
+  `chat, templates, export`, and fine-grained crash-resumability is Task 1's requirement, not this one.
+  Naming it rather than implying the ledger covers it.
+- **The retry budget is fixed, not adaptive.** Three retries with exponential backoff; a sustained
+  outage still fails the run (correctly — it just fails slower and with a message that says why).
 - **`--auto-approve` is for CI/demo runs only.** It still goes through the real approve endpoint (it's
   not a bypass), but production use of this tool should default to interactive review, per the task's
   human-in-the-loop framing.

@@ -43,6 +43,18 @@ class ExportSpec:
 
 
 @dataclass
+class TemplateSpec:
+    """Whether this command should draft from the user's own saved SuperDocs
+    templates (the `templates` surface: list_user_templates / upload_template_base64).
+
+    Verticals run on house paper — a legal team's own NDA, a supplier's own
+    8D form. `use_saved: true` tells the assistant to find that template first
+    rather than inventing house language from scratch."""
+    use_saved: bool = False
+    hint: str = ""
+
+
+@dataclass
 class CommandSpec:
     id: str
     title: str
@@ -51,6 +63,7 @@ class CommandSpec:
     instruction_template: str
     arguments: list[ArgumentSpec] = field(default_factory=list)
     export: ExportSpec = field(default_factory=ExportSpec)
+    templates: TemplateSpec = field(default_factory=TemplateSpec)
     superdocs_tool: str = "chat_async"  # which SuperDocs MCP tool the rendered instruction tells the assistant to call
 
     def argument_names(self) -> set[str]:
@@ -140,6 +153,14 @@ def _parse_command(raw: dict) -> CommandSpec:
         )
     export = ExportSpec(format=export_format, options=export_raw.get("options", {}) or {})
 
+    templates_raw = raw.get("templates", {}) or {}
+    if not isinstance(templates_raw, dict):
+        raise PackSpecError(f"command '{raw['id']}': 'templates' must be a mapping, got {type(templates_raw).__name__}")
+    templates = TemplateSpec(
+        use_saved=bool(templates_raw.get("use_saved", False)),
+        hint=templates_raw.get("hint", "") or "",
+    )
+
     arguments = [_parse_argument(a) for a in raw.get("arguments", []) or []]
     arg_names = {a.name for a in arguments}
 
@@ -172,6 +193,7 @@ def _parse_command(raw: dict) -> CommandSpec:
         instruction_template=raw["instruction_template"],
         arguments=arguments,
         export=export,
+        templates=templates,
         superdocs_tool=raw.get("superdocs_tool", "chat_async"),
     )
 
@@ -198,17 +220,31 @@ _APPROVAL_MODE_GUIDANCE = {
 }
 
 
+def _template_guidance(spec: TemplateSpec) -> str:
+    if not spec.use_saved:
+        return ""
+    hint = f" {spec.hint}" if spec.hint else ""
+    return (
+        "- Templates: call `list_user_templates` FIRST and draft from the user's own saved template."
+        f"{hint} If no saved template matches, say so and offer to have them upload one with "
+        "`upload_template_base64` — do NOT invent house-standard language to fill the gap. "
+        "Drafting a clause the organisation never approved, in a document that looks like theirs, "
+        "is worse than an honest 'you have no template for this yet'.\n"
+    )
+
+
 def render_full_prompt(command: CommandSpec, provided: dict[str, str]) -> str:
     """The complete text handed to the assistant when this slash command is invoked:
     the rendered task instruction plus explicit, unambiguous SuperDocs MCP tool
-    call settings — approval mode and export settings included, so an agent
-    reading this prompt in ANY client makes the same tool calls every time."""
+    call settings — approval mode, template sourcing, and export settings included,
+    so an agent reading this prompt in ANY client makes the same tool calls every time."""
     task = command.render(provided)
     guidance = _APPROVAL_MODE_GUIDANCE[command.approval_mode]
     export_options = f", options={command.export.options!r}" if command.export.options else ""
     return (
         f"{task}\n\n"
         "--- SuperDocs call settings for this workflow (do not deviate) ---\n"
+        f"{_template_guidance(command.templates)}"
         f"{guidance}\n"
         f"- When the work is approved and complete, call `export_document` with "
         f"format=\"{command.export.format}\"{export_options}.\n"

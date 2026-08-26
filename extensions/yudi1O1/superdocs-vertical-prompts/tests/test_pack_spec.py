@@ -47,7 +47,9 @@ def _minimal_pack_dict(**command_overrides) -> dict:
 def test_legal_pack_loads():
     pack = load_pack(LEGAL_PACK_PATH)
     assert pack.pack_id == "legal"
-    assert {c.id for c in pack.commands} == {"redline", "fallback_clause", "obligation_summary"}
+    assert {c.id for c in pack.commands} == {
+        "redline", "fallback_clause", "draft_from_playbook", "obligation_summary",
+    }
 
 
 def test_real_estate_pack_loads():
@@ -182,6 +184,44 @@ def test_approve_all_guidance_differs_from_ask_every_time():
     assert ask_text != approve_text
     assert "approval_mode=\"approve_all\"" in approve_text
     assert "approval_mode=\"ask_every_time\"" in ask_text
+
+
+def test_template_backed_command_tells_the_assistant_to_use_saved_templates():
+    """The `templates` surface: a command marked use_saved must route the
+    assistant through list_user_templates rather than generic boilerplate."""
+    pack = load_pack(LEGAL_PACK_PATH)
+    cmd = pack.get_command("draft_from_playbook")
+    assert cmd.templates.use_saved is True
+    text = render_full_prompt(cmd, {
+        "document_type": "a mutual NDA",
+        "counterparty": "Northwind Logistics GmbH",
+        "key_terms": "2-year term, Delaware law",
+    })
+    assert "list_user_templates" in text
+    assert "upload_template_base64" in text
+
+
+def test_template_backed_command_forbids_inventing_house_language():
+    """Same 'never invent' rule as the FMEA build, applied to house paper: no
+    saved template means say so, not fabricate the organisation's standard."""
+    pack = load_pack(LEGAL_PACK_PATH)
+    cmd = pack.get_command("draft_from_playbook")
+    text = render_full_prompt(cmd, {"document_type": "an NDA", "counterparty": "X", "key_terms": "y"})
+    assert "do NOT invent house-standard language" in text
+
+
+def test_commands_without_templates_get_no_template_guidance():
+    """Guidance is opt-in per command — a redline works on the open document and
+    must not be sent hunting through the template library."""
+    pack = load_pack(LEGAL_PACK_PATH)
+    cmd = pack.get_command("redline")
+    assert cmd.templates.use_saved is False
+    text = render_full_prompt(cmd, {
+        "contract_description": "the MSA",
+        "focus_areas": "liability",
+        "negotiating_position": "mutual",
+    })
+    assert "list_user_templates" not in text
 
 
 def test_export_settings_are_embedded_in_rendered_prompt():

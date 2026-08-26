@@ -2,6 +2,7 @@
 
 Real output from `session.get_prompt("obligation_summary", ...)` against the actual running server
 (`python -m vertical_prompts.server --pack packs/legal/pack.yaml`) — captured, not hand-written.
+Regenerate with `python scripts/capture_transcripts.py`.
 
 **Slash-command invocation** (as a user would type it in Claude Code / Claude Desktop / Cursor):
 

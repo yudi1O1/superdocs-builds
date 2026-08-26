@@ -21,6 +21,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from .client import SuperDocsClient
 from .io_yaml import load_draft_request
+from .ledger import DEFAULT_LEDGER_PATH, RunLedger
 from .validate import validate_request
 from .workflow import approve_all, draft_document
 
@@ -83,9 +84,30 @@ def cmd_draft(args: argparse.Namespace) -> int:
         export_format=args.format,
         approval_callback=callback,
         model_tier=args.model_tier,
+        ledger=RunLedger(args.ledger),
+        force=args.force,
     )
-    print(f"\nDrafted: {result.exported_path}")
+
+    if result.skipped:
+        print(f"\nSkipped (already drafted): {result.exported_path}")
+    else:
+        print(f"\nDrafted: {result.exported_path}")
     print(f"session_id={result.session_id} job_id={result.job_id}")
+    if result.approvals:
+        print(
+            f"Review: {result.approvals.get('approved', 0)} change(s) approved, "
+            f"{result.approvals.get('rejected', 0)} rejected."
+        )
+    if result.verification is not None:
+        v = result.verification
+        if not v.readable:
+            print(f"Verified: not checked — {v.note}")
+        else:
+            print(f"Verified: {v.checked}/{v.checked} expected fact(s) present in the exported file.")
+    if result.attempts > 1:
+        print(f"Attempts: {result.attempts} (a cold session produced no changes on the first try).")
+    if result.usage_summary:
+        print(f"Cost: {result.usage_summary}")
     if result.ai_response:
         print(f"AI: {result.ai_response}")
     return 0
@@ -107,6 +129,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_draft.add_argument("--format", default="docx", choices=["docx", "pdf", "html", "markdown", "txt"])
     p_draft.add_argument("--model-tier", default=None, choices=[None, "turbo", "core", "pro", "max"])
     p_draft.add_argument("--auto-approve", action="store_true", help="Approve every proposed change without prompting (CI/demo use).")
+    p_draft.add_argument(
+        "--ledger", default=DEFAULT_LEDGER_PATH,
+        help="Path to the idempotency ledger that prevents paying twice for an identical draft.",
+    )
+    p_draft.add_argument(
+        "--force", action="store_true",
+        help="Redraft even if an identical draft already completed (spends another operation).",
+    )
     p_draft.set_defaults(func=cmd_draft)
 
     return p

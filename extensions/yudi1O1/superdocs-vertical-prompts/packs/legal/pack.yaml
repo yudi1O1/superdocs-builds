@@ -95,6 +95,46 @@ commands:
       makes relative to the primary position, so the reviewing attorney can
       see the trade-off at a glance.
 
+  - id: draft_from_playbook
+    title: "Draft from a house template"
+    description: >
+      Draft a new agreement from one of the firm's own saved SuperDocs
+      templates, rather than from generic boilerplate.
+    arguments:
+      - name: document_type
+        description: >
+          What to draft — e.g. "a mutual NDA", "a one-way NDA for a vendor
+          pilot", "a statement of work under our existing MSA".
+        required: true
+      - name: counterparty
+        description: "Who it's with, e.g. 'Northwind Logistics GmbH'."
+        required: true
+      - name: key_terms
+        description: >
+          The commercial terms to fill in — e.g. "2-year term, mutual
+          confidentiality, Delaware law, 30-day termination for convenience".
+        required: true
+    approval_mode: approve_all
+    superdocs_tool: chat
+    templates:
+      use_saved: true
+      hint: "Match on document type (NDA, MSA, SOW) and prefer the firm's most recent version of it."
+    export:
+      format: docx
+      options:
+        filename: draft-from-template
+    instruction_template: |
+      Draft {document_type} with {counterparty}, using the firm's own saved
+      template as the starting point.
+
+      Key terms to incorporate: {key_terms}
+
+      Fill in the template's existing structure rather than restructuring it —
+      the house template's clause order, defined terms, and formatting are
+      deliberate. Where the template has a placeholder or bracketed field the
+      key terms above don't cover, leave the bracket visibly in place for the
+      attorney to complete; do not quietly pick a value for it.
+
   - id: obligation_summary
     title: "Summarize contract obligations"
     description: >

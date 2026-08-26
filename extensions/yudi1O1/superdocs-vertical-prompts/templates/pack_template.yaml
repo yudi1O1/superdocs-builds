@@ -73,6 +73,19 @@ commands:
     # chat for approve_all (synchronous is fine when nothing needs review).
     superdocs_tool: chat_async      # or: chat
 
+    # --- templates (the SuperDocs `templates` surface) ----------------------
+    # Set use_saved: true when this command should draft from the user's OWN
+    # saved SuperDocs templates rather than from generic boilerplate — house
+    # NDAs, a supplier's own 8D form, a firm's letterhead. The rendered prompt
+    # then tells the assistant to call `list_user_templates` first, and forbids
+    # inventing house-standard language when nothing matches (offering
+    # `upload_template_base64` instead). Omit the block entirely for commands
+    # that work on the document already open. See packs/legal's
+    # draft_from_playbook for a worked example.
+    templates:
+      use_saved: false
+      hint: "Optional: how to pick among the user's templates, e.g. 'match on document type'."
+
     # --- export ------------------------------------------------------------
     # Pick the format that fits what this command produces: docx for anything
     # meant to look like a real document (redlines, clauses); markdown for

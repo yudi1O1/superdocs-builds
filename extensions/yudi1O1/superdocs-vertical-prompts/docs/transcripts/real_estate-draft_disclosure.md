@@ -2,6 +2,7 @@
 
 Real output from `session.get_prompt("draft_disclosure", ...)` against the actual running server
 (`python -m vertical_prompts.server --pack packs/real_estate/pack.yaml`) — captured, not hand-written.
+Regenerate with `python scripts/capture_transcripts.py`.
 
 **Slash-command invocation** (as a user would type it in Claude Code / Claude Desktop / Cursor):
 
