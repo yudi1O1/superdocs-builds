@@ -97,6 +97,17 @@ messages directly to the user, so this becomes a real, readable error in the sla
 generic 400. See `test_render_missing_required_argument_raises_with_field_name_and_description` and the
 live example below.
 
+## Quickstart — one command, no API key
+
+From a fresh clone:
+
+```bash
+pip install -r requirements.txt && python -m pytest -q
+```
+
+Expect `42 passed` (takes ~40s — most of it is spawning real server subprocesses). No SuperDocs key
+needed and nothing is billed.
+
 ## Setup
 
 ```bash
@@ -190,7 +201,21 @@ open and is deliberately *not* sent hunting through the template library
 
 ## Proving cross-client protocol conformance
 
-Two layers, because clients differ in exactly one place.
+Three layers, ending with an actual client.
+
+**Layer 0 — a real MCP client really connects.** Registered with the Claude Code CLI and health-checked
+by the client itself, not by my own test harness:
+
+![claude mcp add and claude mcp list showing the pack server connected](docs/images/real-client-verified.png)
+
+```bash
+claude mcp add --scope local superdocs-legal-pack -- python -m vertical_prompts.server --pack packs/legal/pack.yaml
+claude mcp list      # superdocs-legal-pack: ... - ✔ Connected
+claude mcp remove superdocs-legal-pack -s local
+```
+
+That is one real client confirming the server starts, speaks MCP, and is served to its prompt surface.
+Layers 1 and 2 below are what extend that to the others.
 
 **Layer 1 — the protocol.** MCP prompts have no per-client logic: every conformant client speaks the same
 `prompts/list` / `prompts/get` JSON-RPC over the same transport. `tests/test_server_protocol.py` spawns
@@ -205,9 +230,10 @@ completes an MCP session against it. A config that is malformed, points at the w
 missing pack fails there — which is the failure a user would actually hit. One test also asserts the same
 pack rendered via two different clients' configs is **byte-identical**.
 
-Five clients covered; the card asks for at least three. I can't drive three GUIs in this environment, and
-say so plainly — but a config that provably launches plus a protocol that provably conforms is what
-"works unchanged across clients" reduces to.
+Five clients covered by config-launch tests; one (Claude Code) additionally verified as a real connected
+client. The card asks for at least three. I can't drive Claude Desktop's or Cursor's GUI in this
+environment and don't claim to have — but a real client connecting, plus configs that provably launch,
+plus a protocol that provably conforms, is what "works unchanged across clients" reduces to.
 
 ```bash
 python -m pytest tests/test_server_protocol.py tests/test_client_configs.py -v
@@ -263,11 +289,10 @@ git diff --exit-code docs/transcripts/    # clean == documentation matches reali
   SuperDocs' own MCP server connected. What's proven here (protocol conformance, correct argument
   handling, correct tool-call guidance in the rendered text) is everything this build's own layer is
   responsible for.
-- **No GUI screenshot of a client's slash menu.** I can't drive Claude Desktop/Cursor's interface from
-  this environment. The screenshot above is a real MCP session rather than a real *client window*, and
-  I'd rather label it accurately than crop a UI to imply something I didn't run. The config-launch tests
-  are the substitute, and I think they're the stronger check — but they are not the same claim as
-  "I watched it appear in Cursor's menu", so I'm not making that claim.
+- **One real client, not three.** Claude Code genuinely connects (shown above). Claude Desktop, Cursor,
+  VS Code and Zed are covered by config-launch tests and protocol conformance, not by me watching their
+  slash menus — I can't drive those GUIs from this environment. The distinction is small given MCP is a
+  standard, but it is a real one and I'd rather state it than crop a screenshot to imply otherwise.
 - **Template *selection* is the assistant's judgment, not the pack's.** `use_saved` tells it to search
   and forbids inventing house language, but nothing here verifies it picked the *right* saved template.
   A stricter version would pass an explicit template id.

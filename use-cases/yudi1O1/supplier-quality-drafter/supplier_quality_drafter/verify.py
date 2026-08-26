@@ -11,6 +11,7 @@ on disk demonstrably contains the engineer's facts. Counted, not claimed.
 """
 from __future__ import annotations
 
+import html
 import os
 import re
 import zipfile
@@ -33,27 +34,58 @@ class VerificationResult:
         return self.readable and not self.missing
 
 
+#: How much of a narrative field to use as a verification anchor. Long enough to
+#: be distinctive, short enough to tolerate harmless reflow by the editor.
+_ANCHOR_LEN = 60
+
+
+def _norm(text: str) -> str:
+    """Collapse whitespace and resolve HTML entities, so a fact and the document
+    text are compared on equal terms (`&` survives a round trip as `&amp;`)."""
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
 def expected_facts(req: DraftRequest) -> list[str]:
-    """The data-derived facts that must appear in any correct draft, on any
+    """The data-derived facts that must appear in a correct draft, on any
     customer's template.
 
-    Deliberately drawn from the input model rather than from the output text,
-    and deliberately not a raw digit scan: a template's own boilerplate contains
+    **Mirrors exactly what `render.py` emits for this `document_type`** — an
+    8D-only document legitimately contains no FMEA table, so demanding one back
+    would fail a perfectly good draft. That is not hypothetical: an earlier
+    version of this function expected every fact regardless of document type,
+    because it was written against the one `combined` example it was developed
+    on. The first run with `document_type: 8d` rejected a correct document. A
+    verifier that wrongly refuses valid work is worse than no verifier, so the
+    two now move together — see `render.render_content_block`.
+
+    Deliberately drawn from the input model rather than the output text, and
+    deliberately not a raw digit scan: a template's own boilerplate contains
     numbers too (one says "1-10 AIAG-VDA scale", another doesn't), and those are
     presentation, not data.
     """
     facts: list[str] = []
-    for fm in req.failure_modes:
-        facts.append(fm.id)
-        rpn = fm.rpn()
-        if rpn is not None:
-            facts.append(str(rpn))
-    for a in req.actions:
-        facts.append(a.id)
-        if a.target_date:
-            facts.append(a.target_date)
-    if req.ppap and req.document_type in ("ppap", "combined"):
+
+    if req.document_type in ("fmea", "combined"):
+        for fm in req.failure_modes:
+            facts.append(fm.id)
+            rpn = fm.rpn()
+            if rpn is not None:
+                facts.append(str(rpn))
+        for a in req.actions:
+            facts.append(a.id)
+            if a.target_date:
+                facts.append(a.target_date)
+
+    if req.document_type in ("ppap", "combined") and req.ppap:
         facts.append(req.ppap.part_number)
+
+    if req.document_type in ("8d", "combined") and req.eightd:
+        # The 8D output is narrative, so anchor on the opening of the two fields
+        # validate.py already treats as mandatory. render.py emits them verbatim.
+        for value in (req.eightd.d2_problem_description, req.eightd.d4_root_cause):
+            if value.strip():
+                facts.append(_norm(value)[:_ANCHOR_LEN])
+
     return facts
 
 
@@ -83,8 +115,8 @@ def verify_export(export_path: str, req: DraftRequest) -> VerificationResult:
     text, readable, note = _extract_text(export_path)
     if not readable:
         return VerificationResult(checked=len(facts), missing=[], readable=False, note=note)
-    normalized = re.sub(r"\s+", " ", text)
-    missing = [f for f in facts if f not in normalized]
+    normalized = _norm(text)
+    missing = [f for f in facts if _norm(f) not in normalized]
     return VerificationResult(checked=len(facts), missing=missing, readable=True)
 
 

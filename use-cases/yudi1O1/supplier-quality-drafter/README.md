@@ -156,14 +156,42 @@ when every entry in 'changes' carries its own. Server said: {...}
 verbatim after each run — operations used, remaining, and tier. Reported, never estimated; when the
 server sends no usage block, the tool says exactly that instead of guessing.
 
-## Setup
+## Quickstart — one command, no API key
+
+From a fresh clone, this installs everything and runs the full test suite:
 
 ```bash
-cd supplier-quality-drafter
+pip install -r requirements.txt && python -m pytest -q
+```
+
+Expect `69 passed`. No SuperDocs key needed and nothing is billed — every test is offline.
+
+To also see the validation gate refuse a draft (still no key, still free):
+
+```bash
+python -m supplier_quality_drafter check examples/sample_input.yaml
+```
+
+## Setup for live drafting
+
+Only needed once you want to actually draft against SuperDocs:
+
+```bash
 python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
 export SUPERDOCS_API_KEY=sk_your_key_here            # get one at use.superdocs.app -> Settings -> API Keys
 ```
+
+Pass the key by environment variable only. Don't paste it into a command line — it lands in your shell
+history, which counts as a public place.
+
+### What it accepts
+
+**Input:** a YAML file matching the dataclasses in [`models.py`](supplier_quality_drafter/models.py),
+with `document_type` of `fmea`, `ppap`, `8d`, or `combined`.
+**Templates:** any format SuperDocs ingests — DOCX, DOC, ODT, PDF, TXT, HTML, MD, RTF.
+**Output:** `docx` (default), `pdf`, `html`, `markdown`, `txt`.
+**Domain:** automotive/manufacturing supplier quality (AIAG-VDA 1–10 severity/occurrence/detection scales).
 
 ## Usage
 
@@ -192,10 +220,33 @@ python -m supplier_quality_drafter draft examples/sample_input.yaml \
   --auto-approve
 ```
 
-**4. Prove content parity across two customer templates (spends real operations):**
+**4. Prove content parity across two customer templates (spends 2 operations per run):**
 
 ```bash
-python scripts/demo_two_templates.py
+python scripts/demo_two_templates.py --runs 3
+```
+
+**5. A second run, on genuinely different documents.** Not a variant of the demo:
+[`examples/second_run_8d_only.yaml`](examples/second_run_8d_only.yaml) is a different part, a different
+process (injection moulding, not stamping/welding), different failure modes, a different customer, and a
+different `document_type` (`8d` alone rather than `combined`) — drafted onto the *other* template. It
+exists so the drafter is demonstrably not fitted to the one example it was developed against, and it
+earned its keep immediately: it exposed the verifier bug described below.
+
+```bash
+python -m supplier_quality_drafter draft examples/second_run_8d_only.yaml \
+  --template templates/customer_template_b.html \
+  --session-id second-run-ch77 \
+  --out out/second-run-ch77.docx --auto-approve
+```
+
+Real output from that run:
+
+```
+Drafted: out/second-run-ch77.docx
+Review: 1 change(s) approved, 0 rejected.
+Verified: 2/2 expected fact(s) present in the exported file.
+Cost: 1 billable request(s) issued. Account: 0/500 operations used this month (500 remaining, tier=free).
 ```
 
 ## Input format
@@ -220,13 +271,48 @@ you'll see it checks out for every row:
 
 ![S/O/D ratings and computed RPN for the BA-204 bracket assembly FMEA](docs/images/rpn-chart.png)
 
-`scripts/demo_two_templates.py`, run live against templates A and B with this same input, confirmed:
+### Measured, not asserted: parity over repeated runs
+
+A single green run would not support the parity claim, because the model is non-deterministic. So
+`scripts/demo_two_templates.py --runs N` states its method up front, samples repeatedly, commits the raw
+per-run data to [`docs/samples/parity-runs.json`](docs/samples/parity-runs.json), and reports the worst
+case rather than an average.
+
+**Method:** 29 data-derived facts (failure-mode ids, S/O/D ratings, computed RPNs, action ids, target
+dates, PPAP part number and level, 8D root cause) must appear verbatim in *both* exports. Derived from
+the input data model, never from the output text. Each run costs 2 billable operations; the loop halts
+on the first failure unless `--keep-going` is passed, so a broken build can't quietly burn an allowance.
+
+**First sample — parity held 1 / 3 runs.** This is the finding that mattered:
+
+| Run | Result |
+| --- | --- |
+| 1 | Template B export contained **none** of the 13 facts — the content never landed |
+| 2 | Template A landed the FMEA table but **silently dropped the PPAP and 8D narratives** |
+| 3 | Clean |
+
+Both failures returned `status: "completed"`. Partial application of a multi-section edit is invisible
+to job status, and my earlier single-run "content parity holds" claim was simply not supported by
+evidence.
+
+**After making verification drive the retry — parity held 3 / 3 runs:**
 
 ```
-OK: all 27 data-derived facts (IDs, S/O/D ratings, computed RPNs, dates, narrative fields) appear
-verbatim in both outputs. The two documents differ only in the surrounding template structure and
-wording — content parity holds.
+run 1/3 ... parity OK  (29 facts, 1+1 attempts, 67.7s)
+run 2/3 ... parity OK  (29 facts, 1+1 attempts, 59.8s)
+run 3/3 ... parity OK  (29 facts, 1+1 attempts, 83.9s)
+
+parity held: 3/3
+latency: median 67.7s, worst 83.9s, stdev 12.3s
+drafts needing a retry (cold-session no-op): 0/6
 ```
+
+**What that does and does not prove.** Note the last line: **zero retries fired** in the second sample,
+so those runs happened to be clean and the retry never had to prove itself there. What is established
+is (a) the failure mode is real and was directly observed, and (b) the tool now *detects* it and
+redrafts rather than shipping a wrong document. What is **not** established is a failure rate — n=3 is a
+smoke sample, not a statistic, and the two samples differing this much is itself evidence the rate is
+unstable. Treat 1/3 and 3/3 as "this is flaky and now guarded", not as a before/after measurement.
 
 ### Two bugs the live runs caught — the second one mattered
 
@@ -275,10 +361,26 @@ Verified: 11/11 expected fact(s) present in the exported file.
 Cost: 1 billable request(s) issued. Account: 0/500 operations used this month (500 remaining, tier=free).
 ```
 
-*Worth reporting upstream, not as a bug but as an integration hazard:* a job can reach `completed` with
-every operation failed, so `status` alone is not a success signal. The response body says so clearly —
-but an integrator switching on status will silently ship false successes, as this one did until a live
-run caught it.
+**3. A verifier that refused valid work (mine).** The first run with `document_type: 8d` rejected a
+*correct* 8D document, because `expected_facts` demanded FMEA rows back — it had been written against
+the one `combined` example it was developed on. A verifier that wrongly refuses valid work is worse than
+no verifier. `expected_facts` now mirrors exactly what `render.py` emits per document type, and a
+parametrized test asserts the invariant across all four types: whatever the renderer produces must
+satisfy the verifier.
+
+### Two things worth reporting upstream
+
+Neither is a crash; both are integration hazards that silently produce wrong output:
+
+1. **A job can reach `status: "completed"` with every operation failed** ("0 of 4 asked could be
+   completed", document untouched). The response body says so clearly, but an integrator switching on
+   status will ship false successes — as this build did until a live run caught it.
+2. **A multi-section edit can apply partially and still report completed.** Observed directly: a
+   four-section draft landed the FMEA table and dropped the PPAP and 8D narratives, with no error and no
+   signal in the status. This is the harder one, because the output *looks* plausible — it is a real
+   document, just missing sections. Anything short of reading the exported file back will miss it.
+
+Both are why this build verifies the exported bytes rather than trusting a status string.
 
 ## Tests (no live key required)
 
@@ -287,7 +389,7 @@ pip install -r requirements.txt   # includes pytest
 python -m pytest tests/ -q
 ```
 
-59 tests, all offline:
+69 tests, all offline:
 
 - `test_validate.py` — the "never invent a number" gate: missing ratings are blocking findings, not
   silently defaulted; out-of-range ratings are rejected; actions must trace to a real failure mode;
@@ -306,10 +408,12 @@ python -m pytest tests/ -q
   status naming a concrete fix, and usage read from the server rather than estimated.
 - `test_ledger.py` — fingerprint stability and sensitivity (instruction, template bytes, export format),
   a deleted output file never reported as "already done", and a corrupt ledger degrading open.
-- `test_never_bluffs.py` — replays the **exact** payload from the live run described above: a
+- `test_never_bluffs.py` — replays the **exact** payloads from the live runs described above: a
   `completed` job that changed nothing must raise rather than report success, must not export, and must
-  not be cached in the ledger; a cold session that settles on retry succeeds; an export missing the
-  engineer's facts is rejected; and an unverifiable format is reported as unverified rather than passed.
+  not be cached in the ledger; a partial application is redrafted from the clean template; a cold session
+  that settles on retry succeeds; an export missing the engineer's facts is rejected; an unverifiable
+  format is reported as unverified rather than passed; and — parametrized over all four document types —
+  whatever `render.py` emits must satisfy `verify.py`, so the verifier can never again refuse valid work.
 
 Every network-touching call is behind a duck-typed interface, so the orchestration tests run against a
 `FakeClient` and the client tests run against a fake transport — **no mocking library, no live key, no

@@ -1,22 +1,39 @@
 #!/usr/bin/env python
-"""Demo: draft the SAME structured input onto TWO different customer templates
-and prove the output differs only in presentation, not content.
+"""Measure content parity across two customer templates, over repeated runs.
 
-This is what "WHAT STRONG LOOKS LIKE" asks for on this build's card: "the same
-inputs re-drafted onto a second customer template change presentation only."
+The claim under test: *the same inputs re-drafted onto a second customer
+template change presentation only.*
 
-Requires a live SUPERDOCS_API_KEY (uses real operations) — this is a demo
-script, not a test. The unit tests in tests/ cover the same logic without
-hitting the network.
+**Method, stated before the result.** Each run drafts the same
+`examples/sample_input_complete.yaml` onto template A and template B, then
+requires every data-derived fact — failure-mode ids, S/O/D ratings, computed
+RPNs, action ids, target dates, PPAP part number and level, 8D root cause — to
+appear verbatim in *both* exports. The fact list is derived from the input data
+model, never from the output text. Deliberately **not** a raw digit scan: each
+template's own boilerplate contains numbers (template A's instructions say
+"1-10 AIAG-VDA scale", template B's don't) and those are presentation, not data.
 
-Usage:
+**Why repeat runs.** A single green run would not support the claim. The model
+is non-deterministic, and this was not theoretical: a cold session was observed
+returning a `completed` job that changed nothing. So this reports every run, the
+spread, and the worst case — not an average that hides the tail.
+
+**Budget and stopping rule.** Each run costs 2 billable operations (one draft per
+template); exports are free. Default is a 1-run smoke check. `--runs N` takes a
+small sample; the loop stops at the first failed run unless `--keep-going` is
+passed, so a broken build cannot quietly burn an allowance.
+
     export SUPERDOCS_API_KEY=sk_...
-    python scripts/demo_two_templates.py
+    python scripts/demo_two_templates.py --runs 3
 """
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import statistics
 import sys
+import time
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -35,17 +52,12 @@ ROOT = os.path.dirname(HERE)
 
 
 def required_facts(req: DraftRequest) -> list[str]:
-    """The exact data-derived facts that must survive onto ANY template,
-    verbatim, regardless of that template's own wording or instructions.
+    """Facts that must survive onto ANY template, verbatim.
 
-    Deliberately NOT a raw number scan over the whole document — a template's
-    own boilerplate (e.g. "1-10 AIAG-VDA scale" in one template's instructions,
-    absent in the other's) contains numbers too, and those are presentation,
-    not data. Comparing "every digit in the file" conflates the two.
-
-    Builds on `verify.expected_facts` (the same check the drafter itself runs
-    after every export, so the demo and the tool can't drift apart) and adds the
-    free-text fields that only matter for a cross-template comparison.
+    Builds on `verify.expected_facts` — the same check the drafter runs after
+    every export, so the demo and the tool cannot drift apart — and adds the
+    free-text and per-factor fields that only matter when comparing two
+    renderings of the same data.
     """
     facts: list[str] = list(expected_facts(req))
     for fm in req.failure_modes:
@@ -57,67 +69,114 @@ def required_facts(req: DraftRequest) -> list[str]:
         facts.append(a.recommended_action)
     if req.ppap and req.ppap.submission_level is not None:
         facts.append(str(req.ppap.submission_level))
-    if req.eightd:
+    if req.eightd and req.eightd.d4_root_cause:
         facts.append(req.eightd.d4_root_cause)
     return facts
 
 
+def one_run(client, req, run_index: int, out_dir: str) -> dict:
+    """Draft onto both templates once and check parity. Returns a raw record."""
+    record: dict = {"run": run_index, "ok": False}
+    started = time.monotonic()
+
+    results = {}
+    for label, template in (("a", "customer_template_a.html"), ("b", "customer_template_b.html")):
+        # A fresh session per run: reusing one would let an earlier run's document
+        # satisfy a later run's check, which would measure nothing.
+        results[label] = draft_document(
+            client, req,
+            template_path=os.path.join(ROOT, "templates", template),
+            session_id=f"parity-run{run_index}-{label}",
+            export_path=os.path.join(out_dir, f"run{run_index}-template-{label}.md"),
+            export_format="markdown",
+            approval_callback=approve_all,
+        )
+
+    texts = {}
+    for label, result in results.items():
+        with open(result.exported_path, encoding="utf-8") as f:
+            texts[label] = f.read()
+
+    facts = required_facts(req)
+    missing = {label: [f for f in facts if f not in text] for label, text in texts.items()}
+
+    record.update(
+        ok=not (missing["a"] or missing["b"]),
+        facts_checked=len(facts),
+        missing_a=missing["a"],
+        missing_b=missing["b"],
+        attempts_a=results["a"].attempts,
+        attempts_b=results["b"].attempts,
+        chars_a=len(texts["a"]),
+        chars_b=len(texts["b"]),
+        seconds=round(time.monotonic() - started, 1),
+        job_a=results["a"].job_id,
+        job_b=results["b"].job_id,
+    )
+    return record
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--runs", type=int, default=1,
+                        help="Sample size. Each run costs 2 billable operations. Default 1 (smoke check).")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="Continue after a failed run instead of stopping (spends more operations).")
+    args = parser.parse_args()
+
     client = SuperDocsClient()
-    # sample_input.yaml deliberately has a missing rating (to demo the validation
-    # gate elsewhere); this demo needs a clean input so it draws on the complete variant.
+    # sample_input.yaml deliberately withholds a rating to demo the validation
+    # gate, so parity is measured on the complete variant.
     req = load_draft_request(os.path.join(ROOT, "examples", "sample_input_complete.yaml"))
 
     out_dir = os.path.join(ROOT, "out")
     os.makedirs(out_dir, exist_ok=True)
 
-    print("Drafting onto template A (Acme Automotive Systems)...")
-    result_a = draft_document(
-        client, req,
-        template_path=os.path.join(ROOT, "templates", "customer_template_a.html"),
-        session_id="demo-two-templates-a",
-        export_path=os.path.join(out_dir, "demo-template-a.md"),
-        export_format="markdown",
-        approval_callback=approve_all,
-    )
+    print(f"Method: {len(required_facts(req))} data-derived facts must appear verbatim in BOTH exports.")
+    print(f"Sample: {args.runs} run(s), {args.runs * 2} billable operation(s). "
+          f"Stopping rule: {'none (--keep-going)' if args.keep_going else 'halt on first failed run'}.\n")
 
-    print("Drafting onto template B (Meridian Powertrain Co.)...")
-    result_b = draft_document(
-        client, req,
-        template_path=os.path.join(ROOT, "templates", "customer_template_b.html"),
-        session_id="demo-two-templates-b",
-        export_path=os.path.join(out_dir, "demo-template-b.md"),
-        export_format="markdown",
-        approval_callback=approve_all,
-    )
+    records = []
+    for i in range(1, args.runs + 1):
+        print(f"run {i}/{args.runs} ...", end=" ", flush=True)
+        try:
+            record = one_run(client, req, i, out_dir)
+        except Exception as e:                      # a failed run is data, not a crash
+            record = {"run": i, "ok": False, "error": f"{type(e).__name__}: {e}"}
+        records.append(record)
+        if record["ok"]:
+            print(f"parity OK  ({record['facts_checked']} facts, "
+                  f"{record['attempts_a']}+{record['attempts_b']} attempts, {record['seconds']}s)")
+        else:
+            print(f"FAILED  {record.get('error') or record.get('missing_a') or record.get('missing_b')}")
+            if not args.keep_going:
+                print("Stopping (stopping rule). Re-run with --keep-going to sample through failures.")
+                break
 
-    with open(result_a.exported_path, encoding="utf-8") as f:
-        text_a = f.read()
-    with open(result_b.exported_path, encoding="utf-8") as f:
-        text_b = f.read()
+    passed = sum(1 for r in records if r["ok"])
+    print(f"\n--- result over {len(records)} run(s) ---")
+    print(f"parity held: {passed}/{len(records)}")
 
-    print(f"\nTemplate A output: {result_a.exported_path} ({len(text_a)} chars)")
-    print(f"Template B output: {result_b.exported_path} ({len(text_b)} chars)")
+    timed = [r["seconds"] for r in records if r.get("seconds")]
+    if timed:
+        spread = f", stdev {statistics.stdev(timed):.1f}s" if len(timed) > 1 else ""
+        # Worst case, not just the average — an average hides the run that hurt.
+        print(f"latency: median {statistics.median(timed):.1f}s, worst {max(timed):.1f}s{spread}")
+    attempts = [r[k] for r in records for k in ("attempts_a", "attempts_b") if r.get(k)]
+    if attempts:
+        retried = sum(1 for a in attempts if a > 1)
+        print(f"drafts needing a retry (cold-session no-op): {retried}/{len(attempts)}")
 
-    facts = required_facts(req)
-    missing_a = [f for f in facts if f not in text_a]
-    missing_b = [f for f in facts if f not in text_b]
+    raw_path = os.path.join(ROOT, "docs", "samples", "parity-runs.json")
+    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    with open(raw_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+    print(f"raw data: {os.path.relpath(raw_path, ROOT)}")
 
-    ok = True
-    if missing_a:
-        print(f"\nFAIL: {len(missing_a)} data fact(s) missing from template A output: {missing_a}")
-        ok = False
-    if missing_b:
-        print(f"\nFAIL: {len(missing_b)} data fact(s) missing from template B output: {missing_b}")
-        ok = False
-
-    if ok:
-        print(
-            f"\nOK: all {len(facts)} data-derived facts (IDs, S/O/D ratings, computed RPNs, dates, "
-            "narrative fields) appear verbatim in both outputs. The two documents differ only in "
-            "the surrounding template structure and wording — content parity holds."
-        )
-    return 0 if ok else 1
+    if passed == len(records) and records:
+        print("\nOK: every data fact appears verbatim in both exports on every run — "
+              "the two documents differ only in template structure and wording.")
+    return 0 if (records and passed == len(records)) else 1
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ def draft_document(
     model_tier: Optional[str] = None,
     ledger: Optional[RunLedger] = None,
     force: bool = False,
-    max_attempts: int = 2,
+    max_attempts: int = 3,
 ) -> DraftResult:
     validation = validate_request(req)
     if not validation.ok_to_draft:
@@ -105,10 +105,6 @@ def draft_document(
                 ),
             )
 
-    # 1. Upload the customer's own template as the active document for this session.
-    upload = client.upload_document(template_path, session_id=session_id)
-    doc_html = upload["html"]
-
     extra = {"approval_mode": "ask_every_time"}
     if model_tier:
         extra["model_tier"] = model_tier
@@ -118,17 +114,33 @@ def draft_document(
     rejected_count = 0
     job_id = ""
     attempt = 0
+    out = ""
+    verification = None
 
-    # 2. Send the drafting instruction as an async HITL request.
+    # The draft is attempted up to `max_attempts` times, and an attempt only
+    # counts as successful once the exported file has been read back and shown
+    # to contain the engineer's facts. Measured over repeated live runs, a
+    # single attempt produced a fully-correct document only about a third of the
+    # time on a four-section `combined` draft: sometimes the turn changed
+    # nothing at all (the documented cold-session warm-up — "send it again and
+    # it settles"), and sometimes it applied only some sections, landing the
+    # FMEA table but silently dropping the PPAP and 8D narratives.
     #
-    # Retried when a turn completes having changed nothing. This is a documented
-    # SuperDocs behavior, not a guess: "the first request in a fresh session can
-    # be slow or can fail while things warm up. Send it again and it settles."
-    # Observed exactly once in testing (a completed job reporting "0 of 4 asked
-    # could be completed" on a cold session), which is why it is handled rather
-    # than reported as a mysterious failure.
+    # Both failures are invisible to `status == "completed"` and both are fixed
+    # by the same thing: reset the document to the pristine template and ask
+    # again. So verification drives the retry rather than merely reporting a
+    # failure after the fact. Uploads and exports are not billed, so the only
+    # cost of an extra attempt is the chat turn itself.
     while attempt < max_attempts:
         attempt += 1
+
+        # 1. Upload the customer's own template as the active document. Done per
+        #    attempt so a retry starts from the clean template rather than
+        #    layering a second draft onto a partially-drafted document.
+        upload = client.upload_document(template_path, session_id=session_id)
+        doc_html = upload["html"]
+
+        # 2. Send the drafting instruction as an async HITL request.
         started = client.chat_async(instruction, session_id=session_id, document_html=doc_html, **extra)
         job_id = started["job_id"]
         job = client.poll_job(job_id)
@@ -161,33 +173,37 @@ def draft_document(
         result = job.get("result", {})
         ai_response = result.get("response", "")
 
-        if document_was_modified(result, doc_html):
+        # 4a. Did the turn change anything at all?
+        if not document_was_modified(result, doc_html):
+            if attempt >= max_attempts:
+                raise DraftNotApplied(
+                    f"The draft turn completed but changed nothing across {attempt} attempt(s), so no "
+                    f"document was produced. Reported as a failure rather than a successful draft, "
+                    f"because the output is not in the state a success would claim.\n"
+                    f"SuperDocs said: {ai_response.strip()[:600]}\n"
+                    f"Fix: re-run; if it repeats, the instruction may not match the template's "
+                    f"structure — check the template actually has the sections being populated."
+                )
+            continue
+
+        # 4b. Export (not billed) and read the file back. "Exported" is not
+        #     "correct"; only the bytes on disk can tell them apart.
+        out = client.export_document(export_path, session_id=session_id, format=export_format)
+        verification = verify_export(out, req)
+
+        if verification.ok or not verification.readable:
             break
 
         if attempt >= max_attempts:
-            raise DraftNotApplied(
-                f"The draft turn completed but changed nothing after {attempt} attempt(s), so no "
-                f"document was produced. This is reported as a failure rather than a successful draft "
-                f"because the output is not in the state a success would claim.\n"
-                f"SuperDocs said: {ai_response.strip()[:600]}\n"
-                f"Fix: re-run (a cold session often settles on the second request); if it repeats, the "
-                f"instruction may not match the template's structure — check the template actually has "
-                f"the sections being populated."
+            raise DraftUnverified(
+                f"Exported {out}, but after {attempt} attempt(s) {len(verification.missing)} of "
+                f"{verification.checked} expected fact(s) are still missing from it: "
+                f"{verification.missing[:10]}. Not reporting this as a successful draft.\n"
+                f"Fix: this is usually a partial application — the edit landed some sections and "
+                f"dropped others. Re-run, or split the draft by document_type (fmea / ppap / 8d) so "
+                f"each turn edits fewer sections."
             )
-
-    # 4. Export the finished, human-approved document. Exports are not billed.
-    out = client.export_document(export_path, session_id=session_id, format=export_format)
-
-    # 5. Prove the engineer's facts actually reached the file. "Exported" is not
-    #    "correct", and only a check on the bytes on disk can tell them apart.
-    verification = verify_export(out, req)
-    if verification.readable and verification.missing:
-        raise DraftUnverified(
-            f"Exported {out}, but {len(verification.missing)} of {verification.checked} expected "
-            f"fact(s) are missing from it: {verification.missing[:10]}. Not reporting this as a "
-            f"successful draft.\nFix: re-run; if it repeats, the template may lack a section the "
-            f"content needs, or the AI dropped part of the table."
-        )
+        # Otherwise: partial application. Loop and redraft from the clean template.
 
     if ledger is not None and fp is not None:
         ledger.record(fp, session_id=session_id, export_path=out, job_id=job_id)

@@ -38,9 +38,6 @@ Team debrief scheduled; lessons folded into new-hire tooling training
 
 ## Part B — Risk Analysis (FMEA)
 
-*Meridian requires the RPN column (S×O×D) on every row; do not submit a row with
-a blank Severity, Occurrence, or Detection rating without marking it TBD explicitly.*
-
 | ID | Function | Failure Mode | Effect | Severity (S) | Occurrence (O) | Detection (D) | RPN (S×O×D) | Current Controls |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | FM-01 | Stamp mounting bracket to print dimensions | Hole position out of tolerance | Bracket misaligns with mating part; assembly line stoppage | 7 | 4 | 3 | 84 | 100% CMM check on first article; SPC on hole position, sample n=5/hr |

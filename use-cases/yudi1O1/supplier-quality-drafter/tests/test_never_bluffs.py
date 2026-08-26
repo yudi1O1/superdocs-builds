@@ -146,6 +146,35 @@ def test_a_cold_session_that_settles_on_retry_succeeds(tmp_path):
     assert out.exists()
 
 
+def test_a_partial_application_is_retried_from_the_clean_template(tmp_path):
+    """Measured live: a four-section draft sometimes lands the FMEA table and
+    silently drops the PPAP/8D narratives. Invisible to job status, and fixed by
+    redrafting — so verification drives the retry instead of just reporting."""
+    template = tmp_path / "t.html"
+    template.write_text(TEMPLATE_HTML, encoding="utf-8")
+    out = tmp_path / "out.md"
+
+    class PartialThenCompleteClient(NoOpClient):
+        def export_document(self, out_path, session_id=None, html=None, format="docx", options=None):
+            self.calls.append("export_document")
+            with open(out_path, "w", encoding="utf-8") as f:
+                if self.attempt < 2:
+                    f.write("# Report\n\n| FM-01 | 7 | 4 | 3 | 84 |\n")   # AC-01/date dropped
+                else:
+                    f.write("# Report\n\n| FM-01 | 7 | 4 | 3 | 84 |\n| AC-01 | 2026-09-30 |\n")
+            return out_path
+
+    client = PartialThenCompleteClient(succeed_on_attempt=1)
+    result = draft_document(client, _request(), template_path=str(template), session_id="s1",
+                            export_path=str(out), export_format="markdown")
+
+    assert result.attempts == 2
+    assert result.verification.ok
+    # Each attempt re-uploads the pristine template rather than layering onto a
+    # half-drafted document.
+    assert client.calls.count("upload_document") == 2
+
+
 def test_export_that_lacks_the_engineers_facts_is_not_called_a_success(tmp_path):
     """'Exported' is not 'correct'. If the file doesn't contain the data, say so."""
     template = tmp_path / "t.html"
@@ -177,6 +206,97 @@ def test_expected_facts_include_ids_and_computed_rpn_but_not_template_boilerplat
     assert "FM-01" in facts and "AC-01" in facts
     assert "84" in facts          # the computed RPN
     assert "1-10" not in facts    # template instruction text, not data
+
+
+# --- the verifier must not refuse valid work -----------------------------------
+#
+# Regression for a second real bug: expected_facts was written against the one
+# `combined` example it was developed on, so the first live run with
+# document_type "8d" rejected a perfectly correct 8D document for "missing" FMEA
+# rows that an 8D legitimately does not contain. Verification must mirror what
+# render.py actually emits for each document type.
+
+def _full_request(document_type: str) -> DraftRequest:
+    from supplier_quality_drafter.models import EightDInputs, PPAPInputs
+
+    return DraftRequest(
+        document_type=document_type,
+        item_or_process="Widget",
+        customer_name="Customer Co",
+        engineer_name="Engineer",
+        failure_modes=[
+            FailureMode(id="FM-01", function="f", failure_mode="fm", effect="e",
+                        severity=7, occurrence=4, detection=3)
+        ],
+        actions=[ActionItem(id="AC-01", failure_mode_id="FM-01", recommended_action="fix",
+                            target_date="2026-09-30")],
+        ppap=PPAPInputs(part_number="P-123", part_name="Part", supplier_name="S",
+                        customer_name="C", submission_level=3,
+                        reason_for_submission="annual"),
+        eightd=EightDInputs(d2_problem_description="Three units rejected for hole position",
+                            d4_root_cause="Locating pin worn beyond specification",
+                            d5_permanent_corrective_actions="Replace the pin"),
+    )
+
+
+def test_8d_only_does_not_demand_the_fmea_table_back():
+    """The exact bug: an 8D document contains no FMEA rows, so requiring them
+    rejected a correct document."""
+    facts = expected_facts(_full_request("8d"))
+    assert not any(f.startswith("FM-") for f in facts)
+    assert not any(f.startswith("AC-") for f in facts)
+    assert "84" not in facts
+    assert any("Locating pin worn" in f for f in facts)   # anchors on the narrative instead
+
+
+def test_fmea_only_does_not_demand_ppap_or_8d_content_back():
+    facts = expected_facts(_full_request("fmea"))
+    assert "FM-01" in facts and "84" in facts
+    assert "P-123" not in facts
+    assert not any("Locating pin" in f for f in facts)
+
+
+def test_ppap_only_expects_the_part_number_and_not_the_fmea_table():
+    facts = expected_facts(_full_request("ppap"))
+    assert "P-123" in facts
+    assert "FM-01" not in facts
+
+
+def test_combined_expects_content_from_all_three_document_kinds():
+    facts = expected_facts(_full_request("combined"))
+    assert "FM-01" in facts
+    assert "P-123" in facts
+    assert any("Locating pin worn" in f for f in facts)
+
+
+@pytest.mark.parametrize("document_type", ["fmea", "ppap", "8d", "combined"])
+def test_a_correctly_rendered_document_verifies_for_every_document_type(tmp_path, document_type):
+    """The end-to-end invariant that closes the class: whatever render.py emits
+    for a document type must satisfy verify.py for that same document type."""
+    from supplier_quality_drafter.render import render_content_block
+
+    req = _full_request(document_type)
+    path = tmp_path / "out.html"
+    path.write_text(render_content_block(req), encoding="utf-8")
+
+    result = verify_export(str(path), req)
+    assert result.ok, f"{document_type}: verifier rejected its own renderer's output: {result.missing}"
+
+
+def test_verification_survives_an_ampersand_in_a_narrative_field(tmp_path):
+    """`&` is emitted as `&amp;`; comparing raw would produce a phantom miss."""
+    from supplier_quality_drafter.models import EightDInputs
+    from supplier_quality_drafter.render import render_content_block
+
+    req = _full_request("8d")
+    req.eightd = EightDInputs(
+        d2_problem_description="Rejected at goods-in & flagged by QA for rework",
+        d4_root_cause="Tooling & fixture drift beyond tolerance",
+        d5_permanent_corrective_actions="Replace",
+    )
+    path = tmp_path / "out.html"
+    path.write_text(render_content_block(req), encoding="utf-8")
+    assert verify_export(str(path), req).ok
 
 
 def test_verification_reads_a_real_docx_without_extra_dependencies(tmp_path):
